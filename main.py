@@ -5,45 +5,66 @@ import os
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN")
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID")
 
-COINBASE_URL = "https://api.exchange.coinbase.com/products"
-
+COINBASE_PRODUCTS = "https://api.exchange.coinbase.com/products"
 SCAN_INTERVAL = 60
 
-# Elite thresholds (swing optimized)
-ATOMIC_SCORE_THRESHOLD = 9.5
-BREAKOUT_SCORE_THRESHOLD = 7.5
+# STRICT THRESHOLDS
+MIN_SWING_SCORE = 8.0
+MIN_DAY_SCORE = 8.8
+MIN_ATOMIC_SCORE = 9.5
 
-print("Coinbase Atomic Scanner started...")
+MIN_VOLUME = 1000000  # liquidity protection
+
+print("Institutional Atomic Scanner Running...")
+
+# =========================
+# TELEGRAM
+# =========================
 
 def send_telegram(message):
+
+    url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
+
+    payload = {
+        "chat_id": TELEGRAM_CHAT_ID,
+        "text": message,
+        "parse_mode": "Markdown"
+    }
+
     try:
-        url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
-
-        payload = {
-            "chat_id": TELEGRAM_CHAT_ID,
-            "text": message,
-            "parse_mode": "Markdown"
-        }
-
         requests.post(url, json=payload, timeout=10)
+    except:
+        pass
 
-    except Exception as e:
-        print("Telegram error:", e)
 
+# =========================
+# FETCH PRODUCTS
+# =========================
 
-def fetch_products():
+def get_products():
+
     try:
-        r = requests.get(COINBASE_URL, timeout=10)
+
+        r = requests.get(COINBASE_PRODUCTS, timeout=10)
         return r.json()
-    except Exception as e:
-        print("Fetch products error:", e)
+
+    except:
+
         return []
 
 
-def fetch_ticker(product_id):
+# =========================
+# FETCH TICKER
+# =========================
+
+def get_ticker(symbol):
+
     try:
-        url = f"https://api.exchange.coinbase.com/products/{product_id}/ticker"
+
+        url = f"https://api.exchange.coinbase.com/products/{symbol}/ticker"
+
         r = requests.get(url, timeout=10)
+
         data = r.json()
 
         price = data.get("price")
@@ -52,71 +73,137 @@ def fetch_ticker(product_id):
         if price is None or volume is None:
             return None
 
-        return {
-            "price": float(price),
-            "volume": float(volume)
-        }
+        return float(price), float(volume)
 
-    except Exception as e:
-        print("Ticker error:", e)
+    except:
+
         return None
 
 
+# =========================
+# SCORE CALCULATION
+# =========================
+
 def calculate_score(volume):
-    score = min(10, volume / 1000000 * 10)
+
+    score = volume / 500000
+
+    if score > 10:
+        score = 10
+
     return score
 
 
-def atomic_alert(symbol, price, score):
+# =========================
+# TRADE CLASSIFICATION
+# =========================
 
-    entry = price * 0.985
-    target = price * 1.08
-    stop = price * 0.965
+def classify_trade(score, volume):
 
-    message = f"""🚨🚨🚨 ATOMIC BREAKOUT DETECTED 🚨🚨🚨
+    if volume < MIN_VOLUME:
+        return None
+
+    if score >= MIN_ATOMIC_SCORE:
+        return "ATOMIC"
+
+    if score >= MIN_DAY_SCORE:
+        return "DAY"
+
+    if score >= MIN_SWING_SCORE:
+        return "SWING"
+
+    return None
+
+
+# =========================
+# BUILD ALERT
+# =========================
+
+def build_alert(symbol, price, score, trade_type):
+
+    entry_low = price * 0.995
+    entry_high = price * 1.01
+
+    target1 = price * 1.06
+    target2 = price * 1.12
+
+    stop = price * 0.97
+
+    if trade_type == "ATOMIC":
+
+        return f"""🚨 ATOMIC BREAKOUT 🚨
 
 Symbol: {symbol}
 
+Type: EXPLOSIVE
+
+Score: {score:.2f}
+
 Price: ${price:.6f}
 
-Entry: ${entry:.6f}
-Target: ${target:.6f}
-Stop: ${stop:.6f}
+Entry Zone:
+${entry_low:.6f} - ${entry_high:.6f}
 
-Momentum Score: {score:.2f}
+Targets:
+${target1:.6f}
+${target2:.6f}
 
-⚠️ PRIORITY ALERT ⚠️
-Explosive move potential detected
+Stop Loss:
+${stop:.6f}
+
+Highest confidence breakout.
 """
 
-    send_telegram(message)
+    if trade_type == "DAY":
 
-
-def breakout_alert(symbol, price, score):
-
-    entry = price * 0.99
-    target = price * 1.04
-    stop = price * 0.975
-
-    message = f"""🚀 Breakout Detected
+        return f"""⚡ DAY TRADE SIGNAL
 
 Symbol: {symbol}
 
+Score: {score:.2f}
+
 Price: ${price:.6f}
 
-Entry: ${entry:.6f}
-Target: ${target:.6f}
-Stop: ${stop:.6f}
+Entry Zone:
+${entry_low:.6f} - ${entry_high:.6f}
 
-Momentum Score: {score:.2f}
+Targets:
+${target1:.6f}
+${target2:.6f}
+
+Stop Loss:
+${stop:.6f}
 """
 
-    send_telegram(message)
+    if trade_type == "SWING":
 
+        return f"""🚀 SWING TRADE SIGNAL
+
+Symbol: {symbol}
+
+Score: {score:.2f}
+
+Price: ${price:.6f}
+
+Entry Zone:
+${entry_low:.6f} - ${entry_high:.6f}
+
+Targets:
+${target1:.6f}
+${target2:.6f}
+
+Stop Loss:
+${stop:.6f}
+"""
+
+
+# =========================
+# SCANNER
+# =========================
 
 def scan():
 
-    products = fetch_products()
+    products = get_products()
 
     for product in products:
 
@@ -128,26 +215,30 @@ def scan():
         if not symbol.endswith("USD"):
             continue
 
-        ticker = fetch_ticker(symbol)
+        ticker = get_ticker(symbol)
 
         if ticker is None:
             continue
 
-        price = ticker["price"]
-        volume = ticker["volume"]
+        price, volume = ticker
 
         score = calculate_score(volume)
 
         print(symbol, "Score:", score)
 
-        if score >= ATOMIC_SCORE_THRESHOLD:
+        trade_type = classify_trade(score, volume)
 
-            atomic_alert(symbol, price, score)
+        if trade_type is None:
+            continue
 
-        elif score >= BREAKOUT_SCORE_THRESHOLD:
+        alert = build_alert(symbol, price, score, trade_type)
 
-            breakout_alert(symbol, price, score)
+        send_telegram(alert)
 
+
+# =========================
+# MAIN LOOP
+# =========================
 
 while True:
 
@@ -155,12 +246,12 @@ while True:
 
         scan()
 
-        print("Scan complete. Sleeping 60 seconds...")
+        print("Scan complete")
 
         time.sleep(SCAN_INTERVAL)
 
     except Exception as e:
 
-        print("Scanner error:", e)
+        print("Error:", e)
 
         time.sleep(10)
