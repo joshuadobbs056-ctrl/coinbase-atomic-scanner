@@ -1,312 +1,166 @@
-import os
-import time
 import requests
-from typing import List, Dict, Optional
+import time
+import os
 
-# =========================
-# ENV VARIABLES (Railway)
-# =========================
+TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN")
+TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID")
 
-BOT_TOKEN = os.environ.get("BOT_TOKEN")
-CHAT_ID = os.environ.get("CHAT_ID")
-
-if not BOT_TOKEN or not CHAT_ID:
-    raise RuntimeError("Missing BOT_TOKEN or CHAT_ID")
-
-# =========================
-# CONFIG
-# =========================
-
-MAX_PRICE = 0.25
-MIN_VOLUME_USDT = 5_000_000
-MIN_CHANGE_PCT = 6
-
-ELITE_SCORE = 8.0
-ATOMIC_SCORE = 9.0
+COINBASE_URL = "https://api.exchange.coinbase.com/products"
 
 SCAN_INTERVAL = 60
 
-COOLDOWN_ELITE = 90 * 60
-COOLDOWN_ATOMIC = 180 * 60
+# Elite thresholds (swing optimized)
+ATOMIC_SCORE_THRESHOLD = 9.5
+BREAKOUT_SCORE_THRESHOLD = 7.5
 
-last_alert = {}
+print("Coinbase Atomic Scanner started...")
 
-BINANCE_24H = "https://api.binance.com/api/v3/ticker/24hr"
-BINANCE_KLINES = "https://api.binance.com/api/v3/klines"
-COINBASE_PRODUCTS = "https://api.exchange.coinbase.com/products"
-
-# =========================
-# TELEGRAM
-# =========================
-
-def send_telegram(text: str, atomic=False):
-
-    url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
-
-    payload = {
-        "chat_id": CHAT_ID,
-        "text": text
-    }
-
-    # Atomic alerts trigger sound/vibration
-    if atomic:
-        payload["disable_notification"] = False
-    else:
-        payload["disable_notification"] = True
-
+def send_telegram(message):
     try:
-        requests.post(url, data=payload, timeout=10)
-    except:
-        pass
+        url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
 
-# =========================
-# HELPERS
-# =========================
+        payload = {
+            "chat_id": TELEGRAM_CHAT_ID,
+            "text": message,
+            "parse_mode": "Markdown"
+        }
 
-def can_alert(key, cooldown):
-    now = time.time()
-    last = last_alert.get(key, 0)
-    return now - last > cooldown
+        requests.post(url, json=payload, timeout=10)
 
-def mark_alert(key):
-    last_alert[key] = time.time()
+    except Exception as e:
+        print("Telegram error:", e)
 
-def format_price(p):
 
-    if p >= 1:
-        return f"{p:.4f}"
-
-    if p >= .01:
-        return f"{p:.6f}"
-
-    return f"{p:.8f}"
-
-# =========================
-# DATA
-# =========================
-
-def get_coinbase_symbols():
-
+def fetch_products():
     try:
-        data = requests.get(COINBASE_PRODUCTS, timeout=10).json()
+        r = requests.get(COINBASE_URL, timeout=10)
+        return r.json()
+    except Exception as e:
+        print("Fetch products error:", e)
+        return []
 
-        bases = set()
 
-        for p in data:
-            if p["quote_currency"] == "USD":
-                bases.add(p["base_currency"])
-
-        return {b + "USDT" for b in bases}
-
-    except:
-        return set()
-
-def get_klines(symbol, interval):
-
-    params = {
-        "symbol": symbol,
-        "interval": interval,
-        "limit": 100
-    }
-
+def fetch_ticker(product_id):
     try:
-        return requests.get(BINANCE_KLINES, params=params, timeout=10).json()
-    except:
+        url = f"https://api.exchange.coinbase.com/products/{product_id}/ticker"
+        r = requests.get(url, timeout=10)
+        data = r.json()
+
+        price = data.get("price")
+        volume = data.get("volume")
+
+        if price is None or volume is None:
+            return None
+
+        return {
+            "price": float(price),
+            "volume": float(volume)
+        }
+
+    except Exception as e:
+        print("Ticker error:", e)
         return None
 
-# =========================
-# SIGNAL LOGIC
-# =========================
 
-def compute_signal(symbol):
+def calculate_score(volume):
+    score = min(10, volume / 1000000 * 10)
+    return score
 
-    k15 = get_klines(symbol, "15m")
-    k5 = get_klines(symbol, "5m")
-    k1 = get_klines(symbol, "1m")
 
-    if not k15 or not k5 or not k1:
-        return None
+def atomic_alert(symbol, price, score):
 
-    closes15 = [float(x[4]) for x in k15]
-    closes5 = [float(x[4]) for x in k5]
-    closes1 = [float(x[4]) for x in k1]
+    entry = price * 0.985
+    target = price * 1.08
+    stop = price * 0.965
 
-    highs5 = [float(x[2]) for x in k5]
-    highs1 = [float(x[2]) for x in k1]
+    message = f"""🚨🚨🚨 ATOMIC BREAKOUT DETECTED 🚨🚨🚨
 
-    vols5 = [float(x[5]) for x in k5]
-    vols1 = [float(x[5]) for x in k1]
+Symbol: {symbol}
 
-    price = closes1[-1]
+Price: ${price:.6f}
 
-    if price > MAX_PRICE:
-        return None
+Entry: ${entry:.6f}
+Target: ${target:.6f}
+Stop: ${stop:.6f}
 
-    breakout5 = price > max(highs5[-20:-1])
-    breakout1 = price > max(highs1[-10:-1])
+Momentum Score: {score:.2f}
 
-    avg_vol5 = sum(vols5[-20:-1]) / 20
-    avg_vol1 = sum(vols1[-20:-1]) / 20
+⚠️ PRIORITY ALERT ⚠️
+Explosive move potential detected
+"""
 
-    vol_ratio5 = vols5[-1] / avg_vol5 if avg_vol5 else 0
-    vol_ratio1 = vols1[-1] / avg_vol1 if avg_vol1 else 0
+    send_telegram(message)
 
-    score = 0
 
-    if breakout5:
-        score += 3
+def breakout_alert(symbol, price, score):
 
-    if breakout1:
-        score += 2
+    entry = price * 0.99
+    target = price * 1.04
+    stop = price * 0.975
 
-    if vol_ratio5 > 2:
-        score += 2
+    message = f"""🚀 Breakout Detected
 
-    if vol_ratio1 > 3:
-        score += 3
+Symbol: {symbol}
 
-    score = min(score, 10)
+Price: ${price:.6f}
 
-    entry_low = price * .995
-    entry_high = price * 1.015
+Entry: ${entry:.6f}
+Target: ${target:.6f}
+Stop: ${stop:.6f}
 
-    stop = price * .94
-    t1 = price * 1.15
-    t2 = price * 1.30
+Momentum Score: {score:.2f}
+"""
 
-    return {
-        "symbol": symbol,
-        "price": price,
-        "score": score,
-        "entry_low": entry_low,
-        "entry_high": entry_high,
-        "stop": stop,
-        "t1": t1,
-        "t2": t2,
-        "vol_ratio1": vol_ratio1,
-        "vol_ratio5": vol_ratio5
-    }
+    send_telegram(message)
 
-# =========================
-# MAIN LOOP
-# =========================
 
-def main():
+def scan():
 
-    send_telegram("Scanner ONLINE")
+    products = fetch_products()
 
-    coinbase = get_coinbase_symbols()
+    for product in products:
 
-    while True:
+        symbol = product.get("id")
 
-        try:
+        if symbol is None:
+            continue
 
-            data = requests.get(BINANCE_24H, timeout=10).json()
+        if not symbol.endswith("USD"):
+            continue
 
-            for coin in data:
+        ticker = fetch_ticker(symbol)
 
-                symbol = coin["symbol"]
+        if ticker is None:
+            continue
 
-                if symbol not in coinbase:
-                    continue
+        price = ticker["price"]
+        volume = ticker["volume"]
 
-                if not symbol.endswith("USDT"):
-                    continue
+        score = calculate_score(volume)
 
-                price = float(coin["lastPrice"])
-                volume = float(coin["quoteVolume"])
-                change = float(coin["priceChangePercent"])
+        print(symbol, "Score:", score)
 
-                if price > MAX_PRICE:
-                    continue
+        if score >= ATOMIC_SCORE_THRESHOLD:
 
-                if volume < MIN_VOLUME_USDT:
-                    continue
+            atomic_alert(symbol, price, score)
 
-                if change < MIN_CHANGE_PCT:
-                    continue
+        elif score >= BREAKOUT_SCORE_THRESHOLD:
 
-                signal = compute_signal(symbol)
+            breakout_alert(symbol, price, score)
 
-                if not signal:
-                    continue
 
-                score = signal["score"]
+while True:
 
-                # =====================
-                # ATOMIC ALERT
-                # =====================
+    try:
 
-                if score >= ATOMIC_SCORE:
+        scan()
 
-                    key = symbol + "_atomic"
+        print("Scan complete. Sleeping 60 seconds...")
 
-                    if not can_alert(key, COOLDOWN_ATOMIC):
-                        continue
+        time.sleep(SCAN_INTERVAL)
 
-                    explosion = int(score * 10)
+    except Exception as e:
 
-                    msg = (
-                        f"🚨🚨🚨 ATOMIC BREAKOUT 🚨🚨🚨\n\n"
+        print("Scanner error:", e)
 
-                        f"{symbol}\n\n"
-
-                        f"Score: {score}/10\n"
-                        f"Explosion Probability: {explosion}%\n\n"
-
-                        f"Entry Zone:\n"
-                        f"{format_price(signal['entry_low'])}"
-                        f" → "
-                        f"{format_price(signal['entry_high'])}\n\n"
-
-                        f"Targets:\n"
-                        f"{format_price(signal['t1'])}\n"
-                        f"{format_price(signal['t2'])}\n\n"
-
-                        f"Stop:\n"
-                        f"{format_price(signal['stop'])}\n\n"
-
-                        f"Volume:\n"
-                        f"1m {signal['vol_ratio1']:.2f}x\n"
-                        f"5m {signal['vol_ratio5']:.2f}x\n\n"
-
-                        f"EXPLOSIVE CONDITIONS"
-                    )
-
-                    send_telegram(msg, atomic=True)
-
-                    mark_alert(key)
-
-                # =====================
-                # ELITE ALERT
-                # =====================
-
-                elif score >= ELITE_SCORE:
-
-                    key = symbol + "_elite"
-
-                    if not can_alert(key, COOLDOWN_ELITE):
-                        continue
-
-                    msg = (
-                        f"🚀 Elite Breakout\n\n"
-                        f"{symbol}\n"
-                        f"Score: {score}/10\n"
-                        f"Price: {format_price(price)}"
-                    )
-
-                    send_telegram(msg, atomic=False)
-
-                    mark_alert(key)
-
-            time.sleep(SCAN_INTERVAL)
-
-        except Exception as e:
-
-            print("Error:", e)
-
-            time.sleep(10)
-
-# =========================
-
-main()
+        time.sleep(10)
