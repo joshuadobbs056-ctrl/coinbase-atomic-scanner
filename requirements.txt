@@ -1,5 +1,5 @@
-requests==2.32.3
-python-dotenv==1.0.1
-pandas==2.2.2
-numpy==2.0.1
+requests
+numpy
+pandas
+python-telegram-bot==13.15
 
