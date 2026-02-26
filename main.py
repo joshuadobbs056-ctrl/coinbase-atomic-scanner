@@ -1,371 +1,593 @@
-import os, time, json, math, statistics, requests
-from datetime import datetime, timezone
+import os
+import time
+import math
+import json
+import random
+from dataclasses import dataclass
+from typing import Dict, List, Optional, Tuple
+
+import requests
+import numpy as np
+import pandas as pd
+
 
 # =========================
-# Config (tune these)
+# Config
 # =========================
 
-COINBASE_BEARER = os.getenv("COINBASE_BEARER_TOKEN", "")
-TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN", "")
-TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
+COINBASE_BASE = "https://api.exchange.coinbase.com"  # public market data
+UA = "money-printer-scanner/1.0"
 
-# Universe filters
-QUOTE_ALLOW = {"USD", "USDC"}
-MIN_24H_USD_VOL = float(os.getenv("MIN_24H_USD_VOL", "2000000"))  # $2M default
-MAX_COINS_SCAN = int(os.getenv("MAX_COINS_SCAN", "400"))          # safety cap
+TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
+TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "").strip()
 
-# Alert dedupe/cooldowns (seconds)
-COOLDOWN_ACCUM = int(os.getenv("COOLDOWN_ACCUM", str(24*3600)))    # 24h
-COOLDOWN_BREAKOUT = int(os.getenv("COOLDOWN_BREAKOUT", str(12*3600)))  # 12h
-COOLDOWN_ATOMIC = int(os.getenv("COOLDOWN_ATOMIC", str(2*3600)))   # 2h
+MAX_COINS = int(os.getenv("MAX_COINS", "250"))
+MIN_24H_USD_VOL = float(os.getenv("MIN_24H_USD_VOL", "2000000"))  # $2M/day liquidity gate
 
-STATE_FILE = "state.json"
+ATOMIC_COOLDOWN_MIN = int(os.getenv("ATOMIC_COOLDOWN_MIN", "180"))
+ACC_COOLDOWN_MIN = int(os.getenv("ACC_COOLDOWN_MIN", "360"))
+SWING_COOLDOWN_MIN = int(os.getenv("SWING_COOLDOWN_MIN", "720"))
 
-# Atomic scan settings
-ATOMIC_LOOKBACK_MIN = int(os.getenv("ATOMIC_LOOKBACK_MIN", "120"))  # last 120 minutes
-ATOMIC_VOL_SPIKE = float(os.getenv("ATOMIC_VOL_SPIKE", "5.0"))      # 5x median
-ATOMIC_RANGE_SPIKE = float(os.getenv("ATOMIC_RANGE_SPIKE", "3.0"))  # 3x median range
-ATOMIC_CLOSE_NEAR_HIGH = float(os.getenv("ATOMIC_CLOSE_NEAR_HIGH", "0.75")) # top 25% of candle
+# scan cadence
+ATOMIC_EVERY_SEC = 60
+ACC_EVERY_SEC = 10 * 60
+SWING_EVERY_SEC = 60 * 60
 
-# Swing/accumulation settings (daily + 1h)
-ACCUM_DAYS = int(os.getenv("ACCUM_DAYS", "20"))
-ACCUM_ATR_PCT_MAX = float(os.getenv("ACCUM_ATR_PCT_MAX", "6.0"))     # "quiet" regime
-ACCUM_OBV_SLOPE_MIN = float(os.getenv("ACCUM_OBV_SLOPE_MIN", "0.0")) # >0 = rising
-
-# Strict breakout settings (daily)
-BREAKOUT_LOOKBACK_DAYS = int(os.getenv("BREAKOUT_LOOKBACK_DAYS", "20"))
-BREAKOUT_VOL_MULT = float(os.getenv("BREAKOUT_VOL_MULT", "2.5"))     # vol > 2.5x avg
-BREAKOUT_CLOSE_NEAR_HIGH = float(os.getenv("BREAKOUT_CLOSE_NEAR_HIGH", "0.7"))
+# strict filters
+STABLE_BASES = {"USDC", "USDT", "DAI", "TUSD", "USDP", "FDUSD", "EURC"}  # exclude stablecoin bases
+EXCLUDE_TOKENS = {"WBTC"}  # optional
 
 # =========================
 # Helpers
 # =========================
 
-def load_state():
-    if os.path.exists(STATE_FILE):
-        try:
-            with open(STATE_FILE, "r") as f:
-                return json.load(f)
-        except Exception:
-            pass
-    return {"last_alert": {}}
+session = requests.Session()
+session.headers.update({"User-Agent": UA, "Accept": "application/json"})
 
-def save_state(state):
-    with open(STATE_FILE, "w") as f:
-        json.dump(state, f)
 
-def now_ts():
+def log(msg: str) -> None:
+    print(msg, flush=True)
+
+
+def http_get(path: str, params: Optional[dict] = None, timeout: int = 15):
+    url = f"{COINBASE_BASE}{path}"
+    r = session.get(url, params=params, timeout=timeout)
+    r.raise_for_status()
+    return r.json()
+
+
+def ema(arr: np.ndarray, period: int) -> np.ndarray:
+    if len(arr) < period:
+        return np.array([])
+    s = pd.Series(arr)
+    return s.ewm(span=period, adjust=False).mean().to_numpy()
+
+
+def rsi(close: np.ndarray, period: int = 14) -> float:
+    if len(close) < period + 1:
+        return float("nan")
+    diff = np.diff(close)
+    gain = np.where(diff > 0, diff, 0.0)
+    loss = np.where(diff < 0, -diff, 0.0)
+    avg_gain = pd.Series(gain).rolling(period).mean().iloc[-1]
+    avg_loss = pd.Series(loss).rolling(period).mean().iloc[-1]
+    if avg_loss == 0:
+        return 100.0
+    rs = avg_gain / avg_loss
+    return 100.0 - (100.0 / (1.0 + rs))
+
+
+def atr(high: np.ndarray, low: np.ndarray, close: np.ndarray, period: int = 14) -> float:
+    if len(close) < period + 1:
+        return float("nan")
+    prev_close = close[:-1]
+    tr = np.maximum(high[1:] - low[1:], np.maximum(np.abs(high[1:] - prev_close), np.abs(low[1:] - prev_close)))
+    return pd.Series(tr).rolling(period).mean().iloc[-1]
+
+
+def pct(a: float, b: float) -> float:
+    # percent change a -> b
+    if a == 0:
+        return 0.0
+    return (b - a) / a * 100.0
+
+
+def now_ts() -> int:
     return int(time.time())
 
-def send_telegram(text):
-    if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
-        print("⚠️ Missing TELEGRAM_TOKEN or TELEGRAM_CHAT_ID")
+
+# =========================
+# Telegram
+# =========================
+
+def telegram_send(text: str) -> None:
+    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
+        log("❌ Missing TELEGRAM_BOT_TOKEN or TELEGRAM_CHAT_ID — not sending.")
         return
-    url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
-    payload = {"chat_id": TELEGRAM_CHAT_ID, "text": text, "parse_mode": "HTML", "disable_web_page_preview": True}
-    r = requests.post(url, json=payload, timeout=20)
-    if r.status_code != 200:
-        print("Telegram error:", r.status_code, r.text)
-
-def cb_headers():
-    return {"Authorization": f"Bearer {COINBASE_BEARER}"}
-
-def cb_list_products():
-    # Coinbase Advanced Trade API: List Products
-    # https://api.coinbase.com/api/v3/brokerage/products  (Bearer required)
-    url = "https://api.coinbase.com/api/v3/brokerage/products"
-    out = []
-    cursor = None
-    while True:
-        params = {}
-        if cursor:
-            params["cursor"] = cursor
-        r = requests.get(url, headers=cb_headers(), params=params, timeout=30)
+    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
+    payload = {
+        "chat_id": TELEGRAM_CHAT_ID,
+        "text": text,
+        "disable_web_page_preview": True,
+    }
+    try:
+        r = requests.post(url, json=payload, timeout=15)
         r.raise_for_status()
-        data = r.json()
-        products = data.get("products", [])
-        out.extend(products)
-        cursor = data.get("cursor")
-        if not cursor:
-            break
-    return out
+    except Exception as e:
+        log(f"❌ Telegram send failed: {e}")
 
-def cb_get_candles(product_id, start_ts, end_ts, granularity):
-    # Coinbase Advanced Trade API: Get Product Candles
-    url = f"https://api.coinbase.com/api/v3/brokerage/products/{product_id}/candles"
-    params = {"start": str(start_ts), "end": str(end_ts), "granularity": granularity}
-    r = requests.get(url, headers=cb_headers(), params=params, timeout=30)
-    r.raise_for_status()
-    candles = r.json().get("candles", [])
-    # candles fields: start, low, high, open, close, volume (strings)
-    # Sort oldest->newest
-    candles_sorted = sorted(candles, key=lambda x: int(x["start"]))
-    return [
-        {
-            "t": int(c["start"]),
-            "o": float(c["open"]),
-            "h": float(c["high"]),
-            "l": float(c["low"]),
-            "c": float(c["close"]),
-            "v": float(c["volume"]),
-        }
-        for c in candles_sorted
-    ]
-
-def pct(a, b):
-    if b == 0:
-        return 0.0
-    return (a - b) / b * 100.0
-
-def ema(values, period):
-    if len(values) < period:
-        return None
-    k = 2 / (period + 1)
-    e = values[0]
-    for x in values[1:]:
-        e = x * k + e * (1 - k)
-    return e
-
-def atr_pct(candles, period=14):
-    if len(candles) < period + 1:
-        return None
-    trs = []
-    for i in range(1, len(candles)):
-        h, l, pc = candles[i]["h"], candles[i]["l"], candles[i-1]["c"]
-        tr = max(h - l, abs(h - pc), abs(l - pc))
-        trs.append(tr)
-    atr = sum(trs[-period:]) / period
-    price = candles[-1]["c"]
-    return (atr / price) * 100.0 if price else None
-
-def obv(candles):
-    if not candles:
-        return []
-    obv_series = [0.0]
-    for i in range(1, len(candles)):
-        if candles[i]["c"] > candles[i-1]["c"]:
-            obv_series.append(obv_series[-1] + candles[i]["v"])
-        elif candles[i]["c"] < candles[i-1]["c"]:
-            obv_series.append(obv_series[-1] - candles[i]["v"])
-        else:
-            obv_series.append(obv_series[-1])
-    return obv_series
-
-def slope(values):
-    # simple slope using endpoints
-    if len(values) < 2:
-        return 0.0
-    return values[-1] - values[0]
-
-def can_alert(state, product_id, alert_type, cooldown):
-    key = f"{product_id}:{alert_type}"
-    last = state["last_alert"].get(key, 0)
-    return now_ts() - last >= cooldown
-
-def mark_alert(state, product_id, alert_type):
-    key = f"{product_id}:{alert_type}"
-    state["last_alert"][key] = now_ts()
 
 # =========================
-# Signal logic
+# Coinbase data
 # =========================
 
-def signal_accumulation(daily):
-    # "quiet base + rising OBV" concept
-    if len(daily) < ACCUM_DAYS:
-        return None
+@dataclass
+class Product:
+    product_id: str  # e.g. "ALEO-USD"
+    base: str        # e.g. "ALEO"
+    quote: str       # e.g. "USD"
 
-    last = daily[-1]
-    atrp = atr_pct(daily, 14)
-    if atrp is None or atrp > ACCUM_ATR_PCT_MAX:
-        return None
 
-    closes = [c["c"] for c in daily[-ACCUM_DAYS:]]
-    highs = [c["h"] for c in daily[-ACCUM_DAYS:]]
-    lows  = [c["l"] for c in daily[-ACCUM_DAYS:]]
-    rng_pct = pct(max(highs), min(lows))
-
-    # Avoid already-breaking out
-    if last["c"] >= max(highs[:-1]):
-        return None
-
-    obv_series = obv(daily[-ACCUM_DAYS:])
-    obv_sl = slope(obv_series)
-    if obv_sl <= ACCUM_OBV_SLOPE_MIN:
-        return None
-
-    # Small uptrend bias: higher lows in last N bars
-    hl_ok = lows[-1] >= min(lows[:-5]) if len(lows) >= 6 else True
-
-    score = 0
-    score += max(0, 10 - atrp)          # quieter = better
-    score += min(10, rng_pct / 2)       # base width
-    score += 5 if hl_ok else 0
-    score += 5 if obv_sl > 0 else 0
-
-    return {"score": round(score, 2), "atr_pct": round(atrp, 2), "range_pct": round(rng_pct, 2)}
-
-def signal_strict_breakout(daily):
-    if len(daily) < BREAKOUT_LOOKBACK_DAYS + 1:
-        return None
-
-    window = daily[-(BREAKOUT_LOOKBACK_DAYS+1):]
-    last = window[-1]
-    prior_high = max(c["h"] for c in window[:-1])
-    if last["c"] <= prior_high:
-        return None
-
-    vols = [c["v"] for c in window[:-1]]
-    avg_vol = sum(vols) / len(vols) if vols else 0
-    if avg_vol <= 0:
-        return None
-    if last["v"] < BREAKOUT_VOL_MULT * avg_vol:
-        return None
-
-    # Close near high (avoid wick fake)
-    candle_range = last["h"] - last["l"]
-    if candle_range <= 0:
-        return None
-    close_pos = (last["c"] - last["l"]) / candle_range
-    if close_pos < BREAKOUT_CLOSE_NEAR_HIGH:
-        return None
-
-    score = (last["v"] / avg_vol) + close_pos * 2
-    return {"score": round(score, 2), "prior_high": prior_high, "vol_mult": round(last["v"]/avg_vol, 2)}
-
-def signal_atomic(min1):
-    # last candle vs median of recent candles
-    if len(min1) < 30:
-        return None
-    last = min1[-1]
-    look = min1[-ATOMIC_LOOKBACK_MIN:] if len(min1) >= ATOMIC_LOOKBACK_MIN else min1[:]
-
-    vols = [c["v"] for c in look[:-1] if c["v"] > 0]
-    ranges = [(c["h"]-c["l"]) for c in look[:-1] if (c["h"]-c["l"]) > 0]
-    if len(vols) < 10 or len(ranges) < 10:
-        return None
-
-    med_vol = statistics.median(vols)
-    med_rng = statistics.median(ranges)
-    if med_vol <= 0 or med_rng <= 0:
-        return None
-
-    vol_mult = last["v"] / med_vol
-    rng_mult = (last["h"] - last["l"]) / med_rng
-
-    if vol_mult < ATOMIC_VOL_SPIKE or rng_mult < ATOMIC_RANGE_SPIKE:
-        return None
-
-    # Close near high
-    candle_range = last["h"] - last["l"]
-    close_pos = (last["c"] - last["l"]) / candle_range if candle_range else 0
-    if close_pos < ATOMIC_CLOSE_NEAR_HIGH:
-        return None
-
-    score = vol_mult + rng_mult + close_pos
-    return {"score": round(score, 2), "vol_mult": round(vol_mult, 2), "rng_mult": round(rng_mult, 2)}
-
-# =========================
-# Main loop
-# =========================
-
-def main():
-    if not COINBASE_BEARER:
-        print("❌ Missing COINBASE_BEARER_TOKEN")
-        return
-
-    state = load_state()
-
-    # 1) Coinbase-only universe
-    products = cb_list_products()
-    universe = []
+def get_products_usd() -> List[Product]:
+    products = http_get("/products")  # public
+    out: List[Product] = []
     for p in products:
-        # fields vary; keep it defensive
-        pid = p.get("product_id") or p.get("productId") or p.get("id")
+        pid = p.get("id") or ""
         if not pid or "-" not in pid:
             continue
         base, quote = pid.split("-", 1)
-        if quote not in QUOTE_ALLOW:
+        if quote != "USD":
             continue
-        status = (p.get("status") or "").lower()
-        if status and status != "online":
+        if base in STABLE_BASES or base in EXCLUDE_TOKENS:
+            continue
+        # some products can be disabled; if present and false -> skip
+        if p.get("trading_disabled") is True:
+            continue
+        out.append(Product(product_id=pid, base=base, quote=quote))
+    return out
+
+
+def get_stats(product_id: str) -> Optional[dict]:
+    # 24h stats endpoint exists on Exchange API
+    try:
+        return http_get(f"/products/{product_id}/stats")
+    except Exception:
+        return None
+
+
+def get_candles(product_id: str, granularity: int, limit: int) -> Optional[pd.DataFrame]:
+    """
+    Exchange candles: returns list of [time, low, high, open, close, volume]
+    granularity in seconds: 60, 300, 900, 3600, 21600, 86400
+    """
+    try:
+        data = http_get(f"/products/{product_id}/candles", params={"granularity": granularity})
+        if not isinstance(data, list) or len(data) == 0:
+            return None
+        # Coinbase returns newest-first; sort ascending by time
+        data = sorted(data, key=lambda x: x[0])
+        df = pd.DataFrame(data, columns=["time", "low", "high", "open", "close", "volume"])
+        df = df.tail(limit).reset_index(drop=True)
+        return df
+    except Exception:
+        return None
+
+
+# =========================
+# De-dup / cooldown cache
+# =========================
+
+class Cooldown:
+    def __init__(self):
+        self.last_sent: Dict[str, int] = {}
+
+    def key(self, product_id: str, signal: str) -> str:
+        return f"{product_id}:{signal}"
+
+    def allowed(self, product_id: str, signal: str, cooldown_min: int) -> bool:
+        k = self.key(product_id, signal)
+        t = now_ts()
+        last = self.last_sent.get(k, 0)
+        return (t - last) >= cooldown_min * 60
+
+    def mark(self, product_id: str, signal: str) -> None:
+        self.last_sent[self.key(product_id, signal)] = now_ts()
+
+
+cooldown = Cooldown()
+
+
+# =========================
+# Signal Logic (STRICT)
+# =========================
+
+def liquidity_ok(product_id: str) -> Tuple[bool, float]:
+    st = get_stats(product_id)
+    if not st:
+        return False, 0.0
+    # stats fields vary; try common ones
+    # volume in base units; last price; we approximate USD vol = volume * last
+    try:
+        vol = float(st.get("volume", 0.0))
+        last = float(st.get("last", st.get("last_price", 0.0)))
+        usd_vol = vol * last
+        return usd_vol >= MIN_24H_USD_VOL, usd_vol
+    except Exception:
+        return False, 0.0
+
+
+def signal_atomic_breakout(product_id: str) -> Optional[dict]:
+    """
+    Goal: catch the BEGINNING, not after the pop.
+    Very strict:
+      - 1m candles (last ~120)
+      - last 5m move >= +2.2%
+      - last 1m volume >= 8x median(60m)
+      - price NOT already up huge: last close <= +7.5% from 30m low
+      - close is near 5m high (within 0.35%) => breakout is happening now
+    """
+    df = get_candles(product_id, granularity=60, limit=120)
+    if df is None or len(df) < 80:
+        return None
+
+    close = df["close"].to_numpy(float)
+    high = df["high"].to_numpy(float)
+    low = df["low"].to_numpy(float)
+    vol = df["volume"].to_numpy(float)
+
+    last = close[-1]
+    low_30m = np.min(low[-30:])
+    high_5m = np.max(high[-5:])
+
+    move_5m = pct(close[-6], last)  # ~5 minutes span
+    if move_5m < 2.2:
+        return None
+
+    med_vol_60 = float(np.median(vol[-60:]))
+    if med_vol_60 <= 0:
+        return None
+    vol_spike = vol[-1] / med_vol_60
+    if vol_spike < 8.0:
+        return None
+
+    already_moved = pct(low_30m, last)
+    if already_moved > 7.5:
+        return None
+
+    near_break = abs(pct(high_5m, last))  # last is close to 5m high
+    if near_break > 0.35:
+        return None
+
+    # micro trend filter: 9 EMA > 21 EMA (on 1m)
+    e9 = ema(close, 9)
+    e21 = ema(close, 21)
+    if len(e9) == 0 or len(e21) == 0 or not (e9[-1] > e21[-1]):
+        return None
+
+    stop = low_30m * 0.995  # just under 30m low
+    target = last * 1.05    # conservative initial target; you can scale out
+
+    return {
+        "signal": "ATOMIC BREAKOUT",
+        "price": last,
+        "move_5m_pct": move_5m,
+        "vol_spike_x": vol_spike,
+        "stop": stop,
+        "target": target,
+        "note": "Strict early-breakout filter (tries to avoid post-pop).",
+    }
+
+
+def signal_accumulation(product_id: str) -> Optional[dict]:
+    """
+    Accumulation Underway (tight range + subtle demand)
+    Uses 15m candles ~ last 7 days (limit 450).
+    Strict:
+      - Range compression: ATR% < 1.25%
+      - Price within top 40% of 7d range (not dead bottom)
+      - Volume trend up: last 2 days avg vol > prior 2 days avg vol by 20%
+      - RSI rising and between 45-65 (not already overbought)
+      - 20EMA slope positive (recent)
+    """
+    df = get_candles(product_id, granularity=900, limit=450)
+    if df is None or len(df) < 200:
+        return None
+
+    close = df["close"].to_numpy(float)
+    high = df["high"].to_numpy(float)
+    low = df["low"].to_numpy(float)
+    vol = df["volume"].to_numpy(float)
+
+    last = close[-1]
+    lo = float(np.min(low))
+    hi = float(np.max(high))
+    if hi <= lo:
+        return None
+
+    # where in range (0 bottom -> 1 top)
+    pos = (last - lo) / (hi - lo)
+    if pos < 0.60:  # needs to be in upper 40% of range
+        return None
+
+    a = atr(high, low, close, 14)
+    if math.isnan(a) or a <= 0:
+        return None
+    atr_pct = a / last * 100.0
+    if atr_pct > 1.25:
+        return None
+
+    # volume trend: compare last 192 candles (~2 days) vs prior 192 (~2 days)
+    if len(vol) < 400:
+        return None
+    v_recent = float(np.mean(vol[-192:]))
+    v_prior = float(np.mean(vol[-384:-192]))
+    if v_prior <= 0:
+        return None
+    if (v_recent / v_prior) < 1.20:
+        return None
+
+    r_now = rsi(close, 14)
+    r_prev = rsi(close[:-20], 14) if len(close) > 60 else float("nan")
+    if math.isnan(r_now) or math.isnan(r_prev):
+        return None
+    if not (45.0 <= r_now <= 65.0):
+        return None
+    if r_now <= r_prev:
+        return None
+
+    e20 = ema(close, 20)
+    if len(e20) == 0:
+        return None
+    # slope: last 10 vs prior 10
+    slope = float(np.mean(e20[-10:]) - np.mean(e20[-20:-10]))
+    if slope <= 0:
+        return None
+
+    # “trigger” level: near range high
+    trigger = hi * 1.002
+    stop = lo * 0.995
+
+    return {
+        "signal": "ACCUMULATION UNDERWAY",
+        "price": last,
+        "atr_pct": atr_pct,
+        "range_pos": pos,
+        "vol_trend_x": (v_recent / v_prior),
+        "trigger": trigger,
+        "stop": stop,
+        "note": "Tight range + improving demand; watch for breakout above trigger.",
+    }
+
+
+def signal_swing(product_id: str) -> Optional[dict]:
+    """
+    Swing Setup (few-day hold)
+    Uses 1h candles (last ~30 days, limit 720).
+    Strict:
+      - Price above 200EMA (trend filter)
+      - 20EMA > 50EMA (trend confirmation)
+      - Breakout: last close > highest high of prior 48h (excluding last candle)
+      - Volume confirmation: last 6h avg vol > prior 24h avg vol by 30%
+      - RSI 50-70 (not stretched)
+    """
+    df = get_candles(product_id, granularity=3600, limit=720)
+    if df is None or len(df) < 300:
+        return None
+
+    close = df["close"].to_numpy(float)
+    high = df["high"].to_numpy(float)
+    low = df["low"].to_numpy(float)
+    vol = df["volume"].to_numpy(float)
+    last = close[-1]
+
+    e20 = ema(close, 20)
+    e50 = ema(close, 50)
+    e200 = ema(close, 200)
+    if len(e20) == 0 or len(e50) == 0 or len(e200) == 0:
+        return None
+
+    if not (last > e200[-1] and e20[-1] > e50[-1]):
+        return None
+
+    if len(high) < 60:
+        return None
+    prior_48h_high = float(np.max(high[-49:-1]))  # exclude last candle
+    if last <= prior_48h_high:
+        return None
+
+    v6 = float(np.mean(vol[-6:]))
+    v24 = float(np.mean(vol[-24:]))
+    if v24 <= 0 or (v6 / v24) < 1.30:
+        return None
+
+    r = rsi(close, 14)
+    if math.isnan(r) or not (50.0 <= r <= 70.0):
+        return None
+
+    # risk model: stop under 24h low; target 1.8R
+    low_24h = float(np.min(low[-24:]))
+    stop = low_24h * 0.995
+    risk = max(0.00000001, last - stop)
+    target = last + 1.8 * risk
+
+    return {
+        "signal": "SWING SETUP",
+        "price": last,
+        "rsi": r,
+        "vol_boost_x": (v6 / v24),
+        "stop": stop,
+        "target": target,
+        "note": "Trend + breakout + volume confirmation (few-day hold style).",
+    }
+
+
+# =========================
+# Alert formatting
+# =========================
+
+def fmt_money(x: float) -> str:
+    if x >= 1:
+        return f"${x:,.4f}"
+    return f"${x:.6f}"
+
+
+def build_message(product_id: str, usd_vol: float, payload: dict) -> str:
+    sig = payload["signal"]
+    price = payload.get("price", 0.0)
+
+    lines = []
+    lines.append(f"💸 MONEY PRINTER — {sig}")
+    lines.append(f"Coin: {product_id}")
+    lines.append(f"Price: {fmt_money(price)}")
+    lines.append(f"24h Liquidity (approx): ${usd_vol:,.0f}")
+
+    # show key fields
+    for k in ["move_5m_pct", "vol_spike_x", "atr_pct", "range_pos", "vol_trend_x", "vol_boost_x"]:
+        if k in payload:
+            val = payload[k]
+            if "pct" in k:
+                lines.append(f"{k}: {val:.2f}%")
+            else:
+                lines.append(f"{k}: {val:.2f}")
+
+    # levels
+    if "trigger" in payload:
+        lines.append(f"Trigger: {fmt_money(payload['trigger'])}")
+    if "target" in payload:
+        lines.append(f"Target: {fmt_money(payload['target'])}")
+    if "stop" in payload:
+        lines.append(f"Stop: {fmt_money(payload['stop'])}")
+
+    note = payload.get("note")
+    if note:
+        lines.append(f"Note: {note}")
+
+    return "\n".join(lines)
+
+
+# =========================
+# Main loops
+# =========================
+
+def pick_universe() -> List[Product]:
+    all_usd = get_products_usd()
+
+    # Filter by liquidity (strict) and then take top by volume estimate
+    scored = []
+    for p in all_usd:
+        ok, usd_vol = liquidity_ok(p.product_id)
+        if not ok:
+            continue
+        scored.append((usd_vol, p))
+        # small jitter to avoid hammering
+        time.sleep(0.08)
+
+    scored.sort(key=lambda x: x[0], reverse=True)
+    universe = [p for _, p in scored[:MAX_COINS]]
+    log(f"Universe size: {len(universe)} (MAX_COINS={MAX_COINS})")
+    return universe
+
+
+def scan_atomic(universe: List[Product]):
+    for p in universe:
+        if not cooldown.allowed(p.product_id, "ATOMIC", ATOMIC_COOLDOWN_MIN):
+            continue
+        ok, usd_vol = liquidity_ok(p.product_id)
+        if not ok:
             continue
 
-        # 24h volume filter (best effort)
-        # Coinbase may provide volume fields per product; keep fallback
-        vol_usd = 0.0
-        for key in ["approximate_quote_24h_volume", "quote_volume_24h", "volume_24h", "usd_volume_24h"]:
-            if key in p:
-                try:
-                    vol_usd = float(p[key])
-                    break
-                except Exception:
-                    pass
-        if vol_usd and vol_usd < MIN_24H_USD_VOL:
+        payload = signal_atomic_breakout(p.product_id)
+        if payload:
+            msg = build_message(p.product_id, usd_vol, payload)
+            telegram_send(msg)
+            cooldown.mark(p.product_id, "ATOMIC")
+
+        time.sleep(0.15)
+
+
+def scan_accumulation(universe: List[Product]):
+    for p in universe:
+        if not cooldown.allowed(p.product_id, "ACC", ACC_COOLDOWN_MIN):
+            continue
+        ok, usd_vol = liquidity_ok(p.product_id)
+        if not ok:
             continue
 
-        universe.append(pid)
+        payload = signal_accumulation(p.product_id)
+        if payload:
+            msg = build_message(p.product_id, usd_vol, payload)
+            telegram_send(msg)
+            cooldown.mark(p.product_id, "ACC")
 
-    universe = universe[:MAX_COINS_SCAN]
-    print(f"Scanning Coinbase products: {len(universe)}")
+        time.sleep(0.20)
 
-    # 2) Scan loop
+
+def scan_swing(universe: List[Product]):
+    for p in universe:
+        if not cooldown.allowed(p.product_id, "SWING", SWING_COOLDOWN_MIN):
+            continue
+        ok, usd_vol = liquidity_ok(p.product_id)
+        if not ok:
+            continue
+
+        payload = signal_swing(p.product_id)
+        if payload:
+            msg = build_message(p.product_id, usd_vol, payload)
+            telegram_send(msg)
+            cooldown.mark(p.product_id, "SWING")
+
+        time.sleep(0.25)
+
+
+def main():
+    telegram_send("✅ MONEY PRINTER scanner booted. (Atomic/Accumulation/Swing)")
+    universe = pick_universe()
+
+    t_atomic = 0
+    t_acc = 0
+    t_swing = 0
+    t_refresh_universe = 0
+
     while True:
-        ts_end = now_ts()
+        t = now_ts()
 
-        for pid in universe:
+        # refresh universe every 6 hours
+        if (t - t_refresh_universe) > 6 * 3600:
             try:
-                # Daily candles for accumulation + strict breakout (last ~60 days)
-                d_start = ts_end - 90*24*3600
-                daily = cb_get_candles(pid, d_start, ts_end, "ONE_DAY")
-
-                acc = signal_accumulation(daily)
-                if acc and can_alert(state, pid, "ACCUM", COOLDOWN_ACCUM):
-                    msg = (
-                        f"🧲 <b>ACCUMULATION UNDERWAY</b>\n"
-                        f"<b>{pid}</b>\n"
-                        f"Score: <b>{acc['score']}</b>\n"
-                        f"ATR%: {acc['atr_pct']} | Base range%: {acc['range_pct']}\n"
-                        f"Price: {daily[-1]['c']}"
-                    )
-                    send_telegram(msg)
-                    mark_alert(state, pid, "ACCUM")
-
-                br = signal_strict_breakout(daily)
-                if br and can_alert(state, pid, "BREAKOUT", COOLDOWN_BREAKOUT):
-                    msg = (
-                        f"🚀 <b>STRICT BREAKOUT</b>\n"
-                        f"<b>{pid}</b>\n"
-                        f"Score: <b>{br['score']}</b>\n"
-                        f"Prior high: {br['prior_high']}\n"
-                        f"Vol multiple: {br['vol_mult']}\n"
-                        f"Price: {daily[-1]['c']}"
-                    )
-                    send_telegram(msg)
-                    mark_alert(state, pid, "BREAKOUT")
-
-                # 1-minute candles for atomic (last few hours)
-                m_start = ts_end - (ATOMIC_LOOKBACK_MIN + 10) * 60
-                min1 = cb_get_candles(pid, m_start, ts_end, "ONE_MINUTE")
-
-                at = signal_atomic(min1)
-                if at and can_alert(state, pid, "ATOMIC", COOLDOWN_ATOMIC):
-                    msg = (
-                        f"⚠️ <b>ATOMIC BREAKOUT</b>\n"
-                        f"<b>{pid}</b>\n"
-                        f"Score: <b>{at['score']}</b>\n"
-                        f"Vol spike: {at['vol_mult']}x | Range spike: {at['rng_mult']}x\n"
-                        f"Price: {min1[-1]['c']}"
-                    )
-                    send_telegram(msg)
-                    mark_alert(state, pid, "ATOMIC")
-
+                universe = pick_universe()
             except Exception as e:
-                print(f"{pid} error: {e}")
+                log(f"Universe refresh failed: {e}")
+            t_refresh_universe = t
 
-        save_state(state)
-        print("Scan complete. Sleeping 60s...")
-        time.sleep(60)
+        # ATOMIC every 60s
+        if (t - t_atomic) >= ATOMIC_EVERY_SEC:
+            log("Running ATOMIC scan...")
+            try:
+                scan_atomic(universe)
+            except Exception as e:
+                log(f"ATOMIC scan error: {e}")
+            t_atomic = t
+
+        # ACC every 10m
+        if (t - t_acc) >= ACC_EVERY_SEC:
+            log("Running ACCUMULATION scan...")
+            try:
+                scan_accumulation(universe)
+            except Exception as e:
+                log(f"ACC scan error: {e}")
+            t_acc = t
+
+        # SWING every 60m
+        if (t - t_swing) >= SWING_EVERY_SEC:
+            log("Running SWING scan...")
+            try:
+                scan_swing(universe)
+            except Exception as e:
+                log(f"SWING scan error: {e}")
+            t_swing = t
+
+        time.sleep(2)
+
 
 if __name__ == "__main__":
     main()
