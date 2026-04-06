@@ -1,8 +1,6 @@
 import os
 import time
 import requests
-import json
-from collections import deque
 
 # ================= CONFIG =================
 
@@ -25,8 +23,6 @@ RSI_PERIOD = 14
 RSI_LONG = 55
 RSI_SHORT = 45
 
-VOLUME_SPIKE_MULT = 1.5
-
 STOP_LOSS = 0.01
 TRAILING_ARM = 0.01
 TRAILING_STOP = 0.008
@@ -35,7 +31,6 @@ TRADE_SIZE = 100
 MAX_OPEN_TRADES = 1
 
 SCAN_INTERVAL = 30
-POSITION_CHECK_INTERVAL = 2
 UPDATE_INTERVAL = 180
 
 START_BALANCE = 500.0
@@ -97,6 +92,41 @@ def calc_rsi(prices, period=14):
 def get_price(candle):
     return candle[4]
 
+# ================= STATUS BUILDER =================
+
+def build_status():
+    lines = [f"📊 Balance: ${balance:.2f}", f"Open Trades: {len(positions)}"]
+
+    for product, pos in positions.items():
+        candles = get_candles(product, ENTRY_GRANULARITY, 2)
+        if not candles:
+            continue
+
+        price = get_price(candles[-1])
+        entry = pos["entry"]
+        side = pos["side"]
+        size = pos["size"]
+
+        pnl_pct = ((price - entry) / entry) * 100 if side == "LONG" else ((entry - price) / entry) * 100
+        pnl_usd = ((price - entry) * size) if side == "LONG" else ((entry - price) * size)
+
+        peak = pos["peak"]
+
+        if side == "LONG":
+            trail_dist = ((peak - price) / peak) * 100
+        else:
+            trail_dist = ((price - peak) / peak) * 100
+
+        lines.append("")
+        lines.append(f"{product} | {side}")
+        lines.append(f"Entry: {entry:.2f}")
+        lines.append(f"Current: {price:.2f}")
+        lines.append(f"PnL: ${pnl_usd:.2f} ({pnl_pct:.2f}%)")
+        lines.append(f"Peak: {peak:.2f}")
+        lines.append(f"Trail Distance: {trail_dist:.2f}%")
+
+    return "\n".join(lines)
+
 # ================= TELEGRAM CONTROL =================
 
 def handle_telegram():
@@ -124,7 +154,7 @@ def handle_telegram():
                 send_telegram("▶️ BOT STARTED")
 
             elif text == "/status":
-                send_telegram(f"📊 Balance: ${balance:.2f}\nOpen Positions: {len(positions)}")
+                send_telegram(build_status())
 
     except:
         pass
@@ -159,7 +189,7 @@ def check_entry(product, trend):
     rsi = calc_rsi(closes)
 
     if not ma or not rsi:
-        return False
+        return None
 
     price = closes[-1]
 
@@ -172,8 +202,6 @@ def check_entry(product, trend):
     return None
 
 def open_position(product, side, price):
-    global balance
-
     if len(positions) >= MAX_OPEN_TRADES:
         return
 
@@ -228,12 +256,11 @@ def close_position(product, price, reason):
     side = pos["side"]
 
     pnl = (price - entry) * size if side == "LONG" else (entry - price) * size
-
     balance += pnl
 
     send_telegram(f"🔴 EXIT ({reason})\n{product}\nPnL: ${pnl:.2f}\nBalance: ${balance:.2f}")
 
-# ================= MAIN LOOP =================
+# ================= MAIN =================
 
 send_telegram("🚀 Futures Trend Bot Started (PAPER MODE)")
 
@@ -246,7 +273,6 @@ while True:
                 continue
 
             trend = detect_trend(product)
-
             if trend == "NONE":
                 continue
 
@@ -262,6 +288,6 @@ while True:
 
     if time.time() - last_update > UPDATE_INTERVAL:
         last_update = time.time()
-        send_telegram(f"📊 Balance: ${balance:.2f}\nOpen Trades: {len(positions)}")
+        send_telegram(build_status())
 
     time.sleep(SCAN_INTERVAL)
