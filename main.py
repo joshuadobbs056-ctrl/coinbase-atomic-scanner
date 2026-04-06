@@ -1,364 +1,267 @@
 import os
 import time
 import requests
+import json
 from collections import deque
-from typing import Optional, Tuple
-
-# ============================================================
-# BTC POSITIVE TURNAROUND ALERT BOT
-# ============================================================
-# - Monitors BTC-USD only
-# - Sends Telegram alerts on bullish turnaround conditions
-# - Sends Telegram status updates every 10 minutes
-# - No trading logic
-# - No ML
-# ============================================================
 
 # ================= CONFIG =================
 
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN", "").strip()
 CHAT_ID = os.getenv("CHAT_ID", "").strip()
 
-PRODUCT = os.getenv("PRODUCT", "BTC-USD").strip()
+RUN_LIVE_TRADING = os.getenv("RUN_LIVE_TRADING", "false").lower() == "true"
 
-SCAN_INTERVAL = int(os.getenv("SCAN_INTERVAL", "60"))
-STATUS_UPDATE_INTERVAL = int(os.getenv("STATUS_UPDATE_INTERVAL", "600"))
-REVERSAL_ALERT_COOLDOWN = int(os.getenv("REVERSAL_ALERT_COOLDOWN", "1800"))
+PRODUCTS = ["BTC-PERP-INTX", "ETH-PERP-INTX"]
 
-MAX_HISTORY = int(os.getenv("MAX_HISTORY", "120"))
+TREND_GRANULARITY = "ONE_HOUR"
+ENTRY_GRANULARITY = "FIVE_MINUTE"
 
-FAST_MA_PERIOD = int(os.getenv("FAST_MA_PERIOD", "20"))
-SLOW_MA_PERIOD = int(os.getenv("SLOW_MA_PERIOD", "50"))
-RSI_PERIOD = int(os.getenv("RSI_PERIOD", "14"))
-BREAKOUT_LOOKBACK = int(os.getenv("BREAKOUT_LOOKBACK", "20"))
-VOLUME_MULT = float(os.getenv("VOLUME_MULT", "1.30"))
+TREND_FAST_MA = 50
+TREND_SLOW_MA = 200
 
-ENABLE_TELEGRAM_REMOTE_STOP = os.getenv("ENABLE_TELEGRAM_REMOTE_STOP", "true").strip().lower() == "true"
-TELEGRAM_COMMAND_POLL_SECONDS = float(os.getenv("TELEGRAM_COMMAND_POLL_SECONDS", "5"))
-TELEGRAM_OFFSET_FILE = os.getenv("TELEGRAM_OFFSET_FILE", "btc_alert_telegram_offset.txt")
+ENTRY_FAST_MA = 20
+RSI_PERIOD = 14
 
-SESSION = requests.Session()
-SESSION.headers.update({"User-Agent": "BTC-Turnaround-Alert-Bot/1.0"})
+RSI_LONG = 55
+RSI_SHORT = 45
 
-price_history = deque(maxlen=MAX_HISTORY)
-volume_history = deque(maxlen=MAX_HISTORY)
+VOLUME_SPIKE_MULT = 1.5
 
-last_status_update = 0.0
-last_reversal_alert = 0.0
-last_telegram_command_check = 0.0
-telegram_update_offset = 0
+STOP_LOSS = 0.01
+TRAILING_ARM = 0.01
+TRAILING_STOP = 0.008
 
-# ================= TELEGRAM =================
+TRADE_SIZE = 100
+MAX_OPEN_TRADES = 1
 
-def send(msg: str) -> None:
+SCAN_INTERVAL = 30
+POSITION_CHECK_INTERVAL = 2
+UPDATE_INTERVAL = 180
+
+START_BALANCE = 500.0
+
+# ================= STATE =================
+
+balance = START_BALANCE
+positions = {}
+running = True
+last_update = 0
+telegram_offset = None
+
+# ================= HELPERS =================
+
+def send_telegram(msg):
     if not TELEGRAM_TOKEN or not CHAT_ID:
-        print(msg)
         return
-
     try:
-        r = SESSION.post(
+        requests.post(
             f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage",
-            json={"chat_id": CHAT_ID, "text": msg},
-            timeout=15
+            json={"chat_id": CHAT_ID, "text": msg}
         )
-        if r.status_code != 200:
-            print(f"Telegram error {r.status_code}: {r.text}")
-    except Exception as e:
-        print(f"Telegram send failed: {e}")
+    except:
+        pass
 
-def load_telegram_offset() -> int:
+def get_candles(product, granularity, limit=200):
     try:
-        if not os.path.exists(TELEGRAM_OFFSET_FILE):
-            return 0
-        with open(TELEGRAM_OFFSET_FILE, "r", encoding="utf-8") as f:
-            return int(f.read().strip() or "0")
-    except Exception:
-        return 0
-
-def save_telegram_offset(offset: int) -> None:
-    try:
-        with open(TELEGRAM_OFFSET_FILE, "w", encoding="utf-8") as f:
-            f.write(str(int(offset)))
-    except Exception as e:
-        print(f"Failed to save telegram offset: {e}")
-
-def get_latest_telegram_updates() -> list:
-    global telegram_update_offset
-
-    if not TELEGRAM_TOKEN or not CHAT_ID:
+        url = f"https://api.exchange.coinbase.com/products/{product.replace('-PERP-INTX','-USD')}/candles"
+        params = {"granularity": 300 if granularity=="FIVE_MINUTE" else 3600}
+        r = requests.get(url, params=params, timeout=10)
+        data = r.json()
+        return list(reversed(data))[-limit:]
+    except:
         return []
 
-    params = {"timeout": 0}
-    if telegram_update_offset > 0:
-        params["offset"] = telegram_update_offset
-
-    try:
-        r = SESSION.get(
-            f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/getUpdates",
-            params=params,
-            timeout=15
-        )
-        if r.status_code != 200:
-            print(f"Telegram getUpdates error {r.status_code}: {r.text}")
-            return []
-
-        payload = r.json()
-        updates = payload.get("result", [])
-
-        if updates:
-            max_update_id = max(int(u.get("update_id", 0)) for u in updates)
-            telegram_update_offset = max_update_id + 1
-            save_telegram_offset(telegram_update_offset)
-
-        return updates
-
-    except Exception as e:
-        print(f"Telegram command fetch failed: {e}")
-        return []
-
-def check_remote_stop_command() -> bool:
-    global last_telegram_command_check
-
-    if not ENABLE_TELEGRAM_REMOTE_STOP:
-        return False
-
-    now = time.time()
-    if now - last_telegram_command_check < TELEGRAM_COMMAND_POLL_SECONDS:
-        return False
-
-    last_telegram_command_check = now
-    updates = get_latest_telegram_updates()
-
-    for update in updates:
-        message = update.get("message", {})
-        chat = message.get("chat", {})
-        chat_id = str(chat.get("id", "")).strip()
-
-        if chat_id != CHAT_ID:
-            continue
-
-        text = str(message.get("text", "")).strip().lower()
-
-        if text in {"/stop", "stop", "/shutdown", "shutdown"}:
-            send("🛑 BTC alert bot stop command received. Shutting down.")
-            return True
-
-    return False
-
-# ================= MARKET DATA =================
-
-def get_candle(product: str) -> Optional[Tuple[float, float]]:
-    url = f"https://api.coinbase.com/api/v3/brokerage/market/products/{product}/candles"
-    params = {
-        "granularity": "FIVE_MINUTE",
-        "limit": 1
-    }
-
-    try:
-        r = SESSION.get(url, params=params, timeout=20)
-        if r.status_code != 200:
-            print(f"Coinbase candle error {product}: {r.status_code} {r.text}")
-            return None
-
-        payload = r.json()
-        candles = payload.get("candles", [])
-        if not candles:
-            return None
-
-        latest = candles[0]
-        close_price = float(latest["close"])
-        volume = float(latest["volume"])
-        return close_price, volume
-
-    except Exception as e:
-        print(f"Failed to fetch candle for {product}: {e}")
+def calc_ma(prices, period):
+    if len(prices) < period:
         return None
+    return sum(prices[-period:]) / period
 
-# ================= INDICATORS =================
-
-def sma(values, period: int) -> Optional[float]:
-    if len(values) < period:
+def calc_rsi(prices, period=14):
+    if len(prices) < period+1:
         return None
-    recent = list(values)[-period:]
-    return sum(recent) / period
-
-def calculate_rsi(prices, period: int = 14) -> Optional[float]:
-    prices = list(prices)
-    if len(prices) < period + 1:
-        return None
-
     gains = []
     losses = []
-
     for i in range(-period, 0):
-        change = prices[i] - prices[i - 1]
-        if change > 0:
-            gains.append(change)
-            losses.append(0.0)
+        diff = prices[i] - prices[i-1]
+        if diff >= 0:
+            gains.append(diff)
         else:
-            gains.append(0.0)
-            losses.append(abs(change))
-
-    avg_gain = sum(gains) / period
-    avg_loss = sum(losses) / period
-
+            losses.append(abs(diff))
+    avg_gain = sum(gains)/period if gains else 0
+    avg_loss = sum(losses)/period if losses else 0
     if avg_loss == 0:
-        return 100.0
-
+        return 100
     rs = avg_gain / avg_loss
-    return 100.0 - (100.0 / (1.0 + rs))
+    return 100 - (100 / (1 + rs))
 
-def get_recent_high(prices, lookback: int) -> Optional[float]:
-    prices = list(prices)
-    if len(prices) < lookback + 1:
-        return None
-    window = prices[-(lookback + 1):-1]
-    if not window:
-        return None
-    return max(window)
+def get_price(candle):
+    return candle[4]
 
-def get_average_volume(volumes, lookback: int) -> Optional[float]:
-    volumes = list(volumes)
-    if len(volumes) < lookback + 1:
-        return None
-    window = volumes[-(lookback + 1):-1]
-    if not window:
-        return None
-    return sum(window) / len(window)
+# ================= TELEGRAM CONTROL =================
 
-# ================= SIGNAL LOGIC =================
+def handle_telegram():
+    global running, telegram_offset
+    if not TELEGRAM_TOKEN:
+        return
+    try:
+        url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/getUpdates"
+        params = {"timeout": 1}
+        if telegram_offset:
+            params["offset"] = telegram_offset
 
-def get_turnaround_signal() -> Optional[dict]:
-    if len(price_history) < max(SLOW_MA_PERIOD, RSI_PERIOD + 1, BREAKOUT_LOOKBACK + 1):
-        return None
+        r = requests.get(url, params=params, timeout=5).json()
 
-    current_price = price_history[-1]
-    current_volume = volume_history[-1]
+        for update in r.get("result", []):
+            telegram_offset = update["update_id"] + 1
+            text = update.get("message", {}).get("text", "")
 
-    fast_ma = sma(price_history, FAST_MA_PERIOD)
-    slow_ma = sma(price_history, SLOW_MA_PERIOD)
-    rsi = calculate_rsi(price_history, RSI_PERIOD)
-    recent_high = get_recent_high(price_history, BREAKOUT_LOOKBACK)
-    avg_volume = get_average_volume(volume_history, BREAKOUT_LOOKBACK)
+            if text == "/stop":
+                running = False
+                send_telegram("🛑 BOT STOPPED")
 
-    if fast_ma is None or slow_ma is None or rsi is None or recent_high is None or avg_volume is None:
-        return None
+            elif text == "/start":
+                running = True
+                send_telegram("▶️ BOT STARTED")
 
-    prev_fast_ma = sma(list(price_history)[:-1], FAST_MA_PERIOD)
-    prev_slow_ma = sma(list(price_history)[:-1], SLOW_MA_PERIOD)
+            elif text == "/status":
+                send_telegram(f"📊 Balance: ${balance:.2f}\nOpen Positions: {len(positions)}")
 
-    fast_cross_up = (
-        prev_fast_ma is not None and
-        prev_slow_ma is not None and
-        prev_fast_ma <= prev_slow_ma and
-        fast_ma > slow_ma
-    )
+    except:
+        pass
 
-    price_above_slow = current_price > slow_ma
-    momentum_ok = rsi >= 52.0
-    breakout_ok = current_price > recent_high
-    volume_ok = current_volume > (avg_volume * VOLUME_MULT)
+# ================= CORE =================
 
-    if fast_cross_up and price_above_slow and momentum_ok and breakout_ok and volume_ok:
-        return {
-            "price": current_price,
-            "fast_ma": fast_ma,
-            "slow_ma": slow_ma,
-            "rsi": rsi,
-            "recent_high": recent_high,
-            "current_volume": current_volume,
-            "avg_volume": avg_volume
-        }
+def detect_trend(product):
+    candles = get_candles(product, TREND_GRANULARITY)
+    closes = [get_price(c) for c in candles]
+
+    ma_fast = calc_ma(closes, TREND_FAST_MA)
+    ma_slow = calc_ma(closes, TREND_SLOW_MA)
+
+    if not ma_fast or not ma_slow:
+        return "NONE"
+
+    if abs(ma_fast - ma_slow) / ma_slow < 0.002:
+        return "NONE"
+
+    if ma_fast > ma_slow:
+        return "LONG"
+    elif ma_fast < ma_slow:
+        return "SHORT"
+
+    return "NONE"
+
+def check_entry(product, trend):
+    candles = get_candles(product, ENTRY_GRANULARITY)
+    closes = [get_price(c) for c in candles]
+
+    ma = calc_ma(closes, ENTRY_FAST_MA)
+    rsi = calc_rsi(closes)
+
+    if not ma or not rsi:
+        return False
+
+    price = closes[-1]
+
+    if trend == "LONG" and price > ma and rsi > RSI_LONG:
+        return "LONG"
+
+    if trend == "SHORT" and price < ma and rsi < RSI_SHORT:
+        return "SHORT"
 
     return None
 
-# ================= STATUS =================
+def open_position(product, side, price):
+    global balance
 
-def send_status_update() -> None:
-    current_price = price_history[-1] if price_history else None
-    fast_ma = sma(price_history, FAST_MA_PERIOD)
-    slow_ma = sma(price_history, SLOW_MA_PERIOD)
-    rsi = calculate_rsi(price_history, RSI_PERIOD)
-    recent_high = get_recent_high(price_history, BREAKOUT_LOOKBACK)
-    avg_volume = get_average_volume(volume_history, BREAKOUT_LOOKBACK)
-    current_volume = volume_history[-1] if volume_history else None
+    if len(positions) >= MAX_OPEN_TRADES:
+        return
 
-    lines = [
-        "📊 BTC 10-MIN STATUS UPDATE",
-        f"Product: {PRODUCT}",
-        f"Price: {f'${current_price:,.2f}' if current_price is not None else 'n/a'}",
-        f"Fast MA ({FAST_MA_PERIOD}): {f'${fast_ma:,.2f}' if fast_ma is not None else 'n/a'}",
-        f"Slow MA ({SLOW_MA_PERIOD}): {f'${slow_ma:,.2f}' if slow_ma is not None else 'n/a'}",
-        f"RSI ({RSI_PERIOD}): {f'{rsi:.2f}' if rsi is not None else 'n/a'}",
-        f"Recent High ({BREAKOUT_LOOKBACK}): {f'${recent_high:,.2f}' if recent_high is not None else 'n/a'}",
-        f"Current Volume: {f'{current_volume:,.2f}' if current_volume is not None else 'n/a'}",
-        f"Avg Volume: {f'{avg_volume:,.2f}' if avg_volume is not None else 'n/a'}",
-        f"Remote Stop: {'ON' if ENABLE_TELEGRAM_REMOTE_STOP else 'OFF'}"
-    ]
+    size = TRADE_SIZE / price
 
-    send("\n".join(lines))
+    positions[product] = {
+        "side": side,
+        "entry": price,
+        "size": size,
+        "peak": price
+    }
 
-def send_reversal_alert(signal: dict) -> None:
-    send(
-        "🚨 BTC POSITIVE TURNAROUND DETECTED 🚨\n"
-        f"Price: ${signal['price']:,.2f}\n"
-        f"Fast MA ({FAST_MA_PERIOD}): ${signal['fast_ma']:,.2f}\n"
-        f"Slow MA ({SLOW_MA_PERIOD}): ${signal['slow_ma']:,.2f}\n"
-        f"RSI: {signal['rsi']:.2f}\n"
-        f"Recent High: ${signal['recent_high']:,.2f}\n"
-        f"Volume: {signal['current_volume']:,.2f}\n"
-        f"Avg Volume: {signal['avg_volume']:,.2f}\n\n"
-        "Bullish turnaround conditions aligned."
-    )
+    send_telegram(f"🟡 PAPER ENTRY {side}\n{product}\nPrice: {price:.2f}")
 
-# ================= STARTUP =================
+def manage_positions():
+    global balance
 
-def startup() -> None:
-    global telegram_update_offset, last_status_update
-    telegram_update_offset = load_telegram_offset()
-    last_status_update = time.time()
+    for product in list(positions.keys()):
+        candles = get_candles(product, ENTRY_GRANULARITY, 2)
+        if not candles:
+            continue
 
-    send(
-        "🚀 BTC POSITIVE TURNAROUND ALERT BOT STARTED\n"
-        f"Product: {PRODUCT}\n"
-        f"Scan Interval: {SCAN_INTERVAL}s\n"
-        f"Status Interval: {STATUS_UPDATE_INTERVAL}s\n"
-        f"Reversal Cooldown: {REVERSAL_ALERT_COOLDOWN}s"
-    )
+        price = get_price(candles[-1])
+        pos = positions[product]
 
-# ================= MAIN =================
+        entry = pos["entry"]
+        side = pos["side"]
 
-startup()
+        pnl = (price - entry) / entry if side == "LONG" else (entry - price) / entry
+
+        if pnl <= -STOP_LOSS:
+            close_position(product, price, "SL")
+            continue
+
+        if pnl > TRAILING_ARM:
+            if side == "LONG":
+                pos["peak"] = max(pos["peak"], price)
+                drop = (pos["peak"] - price) / pos["peak"]
+            else:
+                pos["peak"] = min(pos["peak"], price)
+                drop = (price - pos["peak"]) / pos["peak"]
+
+            if drop >= TRAILING_STOP:
+                close_position(product, price, "TRAIL")
+
+def close_position(product, price, reason):
+    global balance
+
+    pos = positions.pop(product)
+    entry = pos["entry"]
+    size = pos["size"]
+    side = pos["side"]
+
+    pnl = (price - entry) * size if side == "LONG" else (entry - price) * size
+
+    balance += pnl
+
+    send_telegram(f"🔴 EXIT ({reason})\n{product}\nPnL: ${pnl:.2f}\nBalance: ${balance:.2f}")
+
+# ================= MAIN LOOP =================
+
+send_telegram("🚀 Futures Trend Bot Started (PAPER MODE)")
 
 while True:
-    try:
-        if check_remote_stop_command():
-            break
+    handle_telegram()
 
-        candle = get_candle(PRODUCT)
-        if candle:
-            price, volume = candle
-            price_history.append(price)
-            volume_history.append(volume)
+    if running:
+        for product in PRODUCTS:
+            if product in positions:
+                continue
 
-            signal = get_turnaround_signal()
-            now = time.time()
+            trend = detect_trend(product)
 
-            if signal and (now - last_reversal_alert >= REVERSAL_ALERT_COOLDOWN):
-                send_reversal_alert(signal)
-                last_reversal_alert = now
+            if trend == "NONE":
+                continue
 
-            if now - last_status_update >= STATUS_UPDATE_INTERVAL:
-                send_status_update()
-                last_status_update = now
+            signal = check_entry(product, trend)
 
-        time.sleep(SCAN_INTERVAL)
+            if signal:
+                candles = get_candles(product, ENTRY_GRANULARITY, 1)
+                if candles:
+                    price = get_price(candles[-1])
+                    open_position(product, signal, price)
 
-    except KeyboardInterrupt:
-        send("🛑 BTC alert bot stopped manually.")
-        break
-    except Exception as e:
-        print(f"Main loop error: {e}")
-        time.sleep(5)
+        manage_positions()
 
-send("✅ BTC alert bot offline.")
+    if time.time() - last_update > UPDATE_INTERVAL:
+        last_update = time.time()
+        send_telegram(f"📊 Balance: ${balance:.2f}\nOpen Trades: {len(positions)}")
+
+    time.sleep(SCAN_INTERVAL)
